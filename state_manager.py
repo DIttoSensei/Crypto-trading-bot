@@ -26,6 +26,7 @@ That guarantees the file is never left half-written if the process dies.
 """
 
 import json
+import math
 import os
 import tempfile
 import threading
@@ -40,6 +41,21 @@ log = get_logger(__name__)
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _floor_qty(qty: float, precision: int) -> float:
+    """
+    Truncate ``qty`` DOWN to ``precision`` decimals.
+
+    Ordinary ``round()`` rounds to nearest, which can round *up* past what we
+    actually own (0.078593517 -> 0.0786). Selling a quantity larger than the
+    real balance gets rejected by Alpaca, which would strand the position and
+    prevent the stop-loss from ever executing. Flooring can only ever leave a
+    negligible dust remainder behind, which is the safe direction to err.
+    """
+    factor = 10 ** precision
+    return math.floor(float(qty) * factor) / factor
+
 
 
 class StateManager:
@@ -256,8 +272,13 @@ class StateManager:
             reconciled: Dict[str, Any] = {}
 
             for symbol, broker in normalised.items():
-                qty = round(broker["qty"], config.QTY_PRECISION)
+                # FLOOR, never round-to-nearest. round() can round UP (e.g.
+                # 0.078593517 -> 0.0786), which would make us try to sell more
+                # than we actually hold and get the exit order rejected for
+                # insufficient balance. Flooring leaves a harmless dust remainder.
+                qty = _floor_qty(broker["qty"], config.QTY_PRECISION)
                 entry = broker["avg_entry_price"]
+
                 record = local.get(symbol)
 
                 if record is None:

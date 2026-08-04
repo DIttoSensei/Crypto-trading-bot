@@ -533,6 +533,19 @@ Manual trades in the same account will be adopted by the bot on the next cycle
 and managed under its TP/SL rules. If you want to hold something manually, use
 a separate account.
 
+**Adopted positions get TP/SL measured from the broker's average entry price,
+not from where the bot would have entered.** A position you opened yourself at
+a bad price is inherited with its stop already close to being hit — or already
+past it, in which case the bot sells on the very next cycle. Check what the
+account is holding before you start it.
+
+Quantities from the broker are floored, never rounded, to 4 decimals. Rounding
+to nearest could round *up* past the real balance (0.078593517 → 0.0786) and
+the exit order would be rejected for insufficient funds, leaving the stop-loss
+unable to fire. Flooring leaves a negligible dust remainder instead, which is
+the safe direction to err.
+
+
 ---
 
 ## Troubleshooting
@@ -545,10 +558,12 @@ a separate account.
 | `AttributeError: module 'numpy' has no attribute 'NaN'` | pandas-ta vs numpy 2.x. Harmless (fallback engages) or pin `numpy<2` |
 | No bars returned | Symbol format must include the slash (`BTC/USD`, not `BTCUSD`) |
 | `insufficient history for indicator warm-up` | Widen the backtest window: SMA(200) on 15-min bars needs ~2+ days of warm-up |
-
+| Bot reports positions you did not open | It adopted pre-existing positions in the account during reconciliation. Expected - see "Reconciliation caveat" |
+| `Position cap reached (2/2 open)` | `MAX_POSITIONS` is 2. Close a position or raise the cap |
 | Every symbol logs `NEUTRAL` | Expected. The entry filter is narrow; verify with the backtest |
 | Orders rejected for buying power | Crypto is cash-only on Alpaca. Check `cash`, not margin buying power |
 | `403 forbidden` | Crypto trading not enabled on the account, or live keys used with `ALPACA_PAPER=true` |
+
 
 ---
 
