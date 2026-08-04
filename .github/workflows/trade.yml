@@ -1,0 +1,95 @@
+# Free 24/7-ish scheduling for the crypto bot using GitHub Actions cron.
+#
+# WHY THIS WORKS WITHOUT PAYING FOR A HOST
+# The bot's `--once` mode runs a single cycle and exits. It reconciles against
+# Alpaca at the start of every run and treats the broker as the source of truth,
+# so it does not need a persistent disk or a long-lived process. GitHub runs the
+# cycle for you on a schedule.
+#
+# READ THIS BEFORE RELYING ON IT
+#   * Public repos get unlimited free Actions minutes. Private repos get 2,000
+#     minutes/month - at ~2 min per run every 15 min (~2,880 runs/month) a
+#     private repo WILL exceed the free quota. Keep the repo public (secrets
+#     stay secret; they live in Settings -> Secrets, not in the code) or widen
+#     the schedule to every 30-60 minutes.
+#   * GitHub cron is BEST EFFORT. Runs are frequently delayed 5-15+ minutes
+#     under load and can occasionally be skipped entirely. Your stop-loss check
+#     is therefore even less punctual than the 15-minute polling already
+#     implies. See "Known risks" in README.md.
+#   * Scheduled workflows are auto-DISABLED after 60 days of repository
+#     inactivity. GitHub emails you; re-enable it in the Actions tab.
+#   * This is fine for PAPER trading. Do not trust it with real money.
+
+name: Crypto Bot Cycle
+
+on:
+  schedule:
+    # Every 15 minutes. Loosen to "*/30 * * * *" or "0 * * * *" to cut usage.
+    - cron: "*/15 * * * *"
+  # Lets you trigger a run by hand from the Actions tab.
+  workflow_dispatch:
+
+# Never let two cycles run at once - concurrent runs could double-submit orders.
+concurrency:
+  group: crypto-bot-cycle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Best-effort state carry-over between runs. Losing it is safe: the bot
+      # rebuilds TP/SL from Alpaca's average entry price on the next cycle.
+      - name: Restore position state
+        uses: actions/cache/restore@v4
+        with:
+          path: positions.json
+          key: positions-${{ github.run_id }}
+          restore-keys: |
+            positions-
+
+      - name: Run one trading cycle
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER: "true"
+          WATCHLIST: "BTC/USD,ETH/USD,SOL/USD"
+          MAX_POSITIONS: "2"
+          MAX_TOTAL_EXPOSURE_PCT: "0.20"
+          MIN_NOTIONAL_USD: "10"
+          LOG_LEVEL: "INFO"
+        run: python -u main.py --once
+
+      - name: Save position state
+        # Runs even if the cycle failed, so a partially updated state is kept.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: positions.json
+          key: positions-${{ github.run_id }}
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-bot-log-${{ github.run_id }}
+          path: crypto_bot.log
+          retention-days: 7
+          if-no-files-found: ignore

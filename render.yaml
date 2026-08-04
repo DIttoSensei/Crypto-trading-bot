@@ -1,0 +1,60 @@
+# Render Blueprint for the Alpaca crypto trading bot.
+#
+# IMPORTANT: this is a WORKER, not a web service. It has no HTTP port; it just
+# runs main.py forever. Render's free tier does NOT include background workers
+# and free web services are spun down when idle - which would stop your
+# stop-loss monitoring. A paid Starter worker is the minimum sane option.
+#
+# Usage:
+#   1. Push this repo to GitHub.
+#   2. Render dashboard -> New -> Blueprint -> pick the repo.
+#   3. Set ALPACA_API_KEY and ALPACA_SECRET_KEY in the dashboard (sync: false
+#      below means Render will prompt for them instead of reading them here).
+#   4. Add a persistent disk if you want positions.json to survive restarts.
+#
+# NOTE ON STATE: Render's filesystem is ephemeral. Without the disk mount
+# below, positions.json is wiped on every deploy/restart. That is survivable
+# because the bot reconciles against Alpaca on boot (the broker is the source
+# of truth), but you lose the original TP/SL anchors and they get rebuilt from
+# the broker's average entry price. Mount the disk if you care about that.
+
+services:
+  - type: worker
+    name: alpaca-crypto-bot
+    runtime: python
+    plan: starter          # free tier does not support workers
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u main.py
+    autoDeploy: false      # do not let a git push restart a bot holding positions
+    disk:
+      name: bot-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: ALPACA_API_KEY
+        sync: false        # set in the Render dashboard, never in this file
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ALPACA_PAPER
+        value: "true"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: WATCHLIST
+        value: "BTC/USD,ETH/USD,SOL/USD"
+      - key: LOOP_INTERVAL_SECONDS
+        value: "900"
+      - key: MAX_POSITIONS
+        value: "2"
+      - key: MAX_TOTAL_EXPOSURE_PCT
+        value: "0.20"
+      - key: MIN_NOTIONAL_USD
+        value: "10"
+      - key: LOG_LEVEL
+        value: "INFO"
+      # Keep state on the mounted disk so it survives restarts.
+      - key: POSITIONS_FILE
+        value: "/var/data/positions.json"
+      # Log to stdout only (Render captures it); the disk is for state.
+      - key: LOG_FILE
+        value: "/var/data/crypto_bot.log"

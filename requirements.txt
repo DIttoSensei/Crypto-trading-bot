@@ -1,0 +1,21 @@
+# Core dependencies for the Alpaca crypto trading bot
+# Install with:  pip install -r requirements.txt
+
+# Official Alpaca SDK (trading + market data)
+alpaca-py>=0.21.0
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Technical indicators.
+# NOTE: pandas-ta 0.3.14b0 imports `numpy.NaN`, which was removed in numpy 2.x.
+# strategy.py automatically falls back to equivalent built-in pandas
+# implementations if the import fails, so the bot runs either way.
+pandas-ta>=0.3.14b0
+
+# Environment variable loading (.env)
+python-dotenv>=1.0.0
+
+# HTTP stack used by alpaca-py
+requests>=2.31.0
