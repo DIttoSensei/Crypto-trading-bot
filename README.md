@@ -90,11 +90,17 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`pandas-ta` is optional. Version `0.3.14b0` imports `numpy.NaN`, which numpy
-2.x removed, so the import can fail on new environments. `strategy.py` detects
-that and transparently falls back to equivalent built-in pandas indicator
-implementations (Wilder-smoothed RSI included), so the bot runs either way. If
-you want pandas-ta specifically, pin `numpy<2`.
+`pandas-ta` is **not** a dependency, deliberately. It has been withdrawn from
+PyPI (`pip install pandas-ta` now fails with "No matching distribution found"),
+and the last release imported `numpy.NaN`, which numpy 2.x removed. Neither
+matters: `strategy.py` detects whether pandas-ta is importable and otherwise
+uses equivalent built-in pandas implementations — SMA, EMA and a proper
+Wilder-smoothed RSI — producing the same values. If you want pandas-ta anyway,
+install it yourself with `pip install "numpy<2" pandas-ta`.
+
+`pandas` is pinned to `<3.0` because pandas 3.x is a breaking major release
+that has not been validated against this code.
+
 
 ### 3. Configure credentials
 
@@ -534,10 +540,12 @@ a separate account.
 | Symptom | Cause / fix |
 |---|---|
 | `RuntimeError: Missing required environment variable(s)` | `.env` missing or keys blank. Copy `.env.example` and fill it in |
-| `ModuleNotFoundError: pandas_ta` | Optional. The bot falls back automatically; or `pip install pandas-ta` |
+| `ERROR: No matching distribution found for pandas-ta` | pandas-ta was withdrawn from PyPI. It is no longer in `requirements.txt` and is not needed - `strategy.py` uses built-in pandas indicators |
+| `ModuleNotFoundError: pandas_ta` | Harmless. The bot falls back to built-in indicators automatically |
 | `AttributeError: module 'numpy' has no attribute 'NaN'` | pandas-ta vs numpy 2.x. Harmless (fallback engages) or pin `numpy<2` |
 | No bars returned | Symbol format must include the slash (`BTC/USD`, not `BTCUSD`) |
 | `insufficient history for indicator warm-up` | Widen the backtest window: SMA(200) on 15-min bars needs ~2+ days of warm-up |
+
 | Every symbol logs `NEUTRAL` | Expected. The entry filter is narrow; verify with the backtest |
 | Orders rejected for buying power | Crypto is cash-only on Alpaca. Check `cash`, not margin buying power |
 | `403 forbidden` | Crypto trading not enabled on the account, or live keys used with `ALPACA_PAPER=true` |
@@ -551,5 +559,3 @@ of any kind. Algorithmic trading carries substantial risk of loss. The authors
 accept no liability for financial losses incurred through its use. Do not point
 this at a live account with real money unless you fully understand the code and
 accept the consequences.
-#   C r y p t o - t r a d i n g - b o t  
- 

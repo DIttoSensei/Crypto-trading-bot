@@ -4,18 +4,32 @@
 # Official Alpaca SDK (trading + market data)
 alpaca-py>=0.21.0
 
-# Data handling
-pandas>=2.0.0
+# Data handling.
+# pandas is pinned below 3.0 because 3.x is a breaking major release that has
+# not been validated against this codebase.
+pandas>=2.0.0,<3.0.0
 numpy>=1.24.0
-
-# Technical indicators.
-# NOTE: pandas-ta 0.3.14b0 imports `numpy.NaN`, which was removed in numpy 2.x.
-# strategy.py automatically falls back to equivalent built-in pandas
-# implementations if the import fails, so the bot runs either way.
-pandas-ta>=0.3.14b0
 
 # Environment variable loading (.env)
 python-dotenv>=1.0.0
 
 # HTTP stack used by alpaca-py
 requests>=2.31.0
+
+# ---------------------------------------------------------------------------
+# NOTE ON TECHNICAL INDICATORS (pandas-ta)
+#
+# pandas-ta is deliberately NOT listed as a dependency:
+#   * It has been withdrawn from PyPI - `pip install pandas-ta` now fails with
+#     "No matching distribution found" on current Python versions.
+#   * The old 0.3.14b0 release imports `numpy.NaN`, which numpy 2.x removed,
+#     so it would crash on import even if it were still available.
+#
+# strategy.py does not need it. It detects whether pandas-ta is importable and
+# otherwise uses equivalent built-in pandas implementations (SMA, EMA, and a
+# proper Wilder-smoothed RSI). The indicator values are the same.
+#
+# If you specifically want pandas-ta anyway, install it yourself alongside a
+# compatible numpy, e.g.:
+#     pip install "numpy<2" pandas-ta
+# ---------------------------------------------------------------------------
