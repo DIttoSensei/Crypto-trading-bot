@@ -384,9 +384,9 @@ drive it. `.github/workflows/trade.yml` is included and ready:
 2. **Settings → Secrets and variables → Actions → New repository secret**, and
    add `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`. Secrets are encrypted and are
    never visible in the repo, logs, or to forks.
-3. **Actions** tab → enable workflows. The workflow fires every 30 minutes; each
-   delivered run executes **6 cycles at 5-minute intervals** internally, so
-   in-run coverage is 25 of the 30 minutes rather than 1 check per half hour.
+3. **Actions** tab → enable workflows. The workflow fires every **10 minutes**;
+   each delivered run executes **2 cycles at 5-minute intervals** internally,
+   covering the full 10-minute window with roughly 12 minutes of runtime.
 4. Hit **Run workflow** once manually to confirm it works before trusting the
    schedule.
 
@@ -394,24 +394,24 @@ Run it locally the same way:
 
 ```bash
 python main.py --once          # one cycle, then exit
-python main.py --cycles 6      # six cycles, then exit
+python main.py --cycles 2      # two cycles, then exit
 python main.py --interval 300  # 5-minute gap between cycles
 ```
 
 The honest caveats:
 
 - **Keep the repo public**, or enlarge the cron. Public repos get unlimited
-  free Actions minutes. A 30-minute schedule on a private repo still exceeds
-  the 2,000-minute limit, so if you need this setup on a private repo set the
-  cron to hourly or wider.
+  free Actions minutes. Private repos get 2,000/month and a 10-min schedule
+  would exceed it.
 - **GitHub cron is best-effort.** Runs are routinely delayed 5–15+ minutes and
-  can be skipped entirely when the platform is under load.
-- **The `*/15` slot is the single most oversubscribed schedule on GitHub and
-  most of those slots are silently dropped.** That is why the workflow now uses
-  `*/30` with internal batching — you get far more *actual* deliveries from a
-  30-minute slot than by asking for 15. Each delivered run covers the gap with
-  multiple cycles. If a run is dropped, the gap is 60 minutes worst-case
-  instead of 240 minutes under the old config.
+  can be skipped entirely when the platform is under load. No free scheduler
+  can guarantee punctual delivery; what matters is reducing the damage when a
+  run is dropped.
+- **10-minute contention is why this schedule was chosen.** The `*/15` slot is
+  the most oversubscribed on the platform and most of those runs are silently
+  dropped. `*/10` slots have far less competition, so delivery rate should be
+  much better — but it is still best-effort, not guaranteed.
+
 - **`internal server error` / `job was not acquired by a runner`** are
   GitHub-side capacity failures, not bugs in this code. The install step retries
   three times to absorb the common flavour; a whole-job failure just means that

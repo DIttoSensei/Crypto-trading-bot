@@ -9,21 +9,20 @@
 #   * GitHub cron is BEST EFFORT and it is NOT a reliable 15-minute timer.
 #     The `*/15` slot is the single most oversubscribed schedule on the whole
 #     platform, so GitHub silently DROPS most of those runs under load. In
-#     practice this workflow was delivering roughly one run every 2 hours -
-#     about 12% of the requested slots.
+#     practice the old config was delivering roughly one run every 2 hours.
 #
-#     The mitigation below is "internal batching": the schedule asks for a run
-#     every 30 minutes (a far less contested slot, so far more of them are
-#     actually delivered), and each delivered run then executes SEVERAL cycles
-#     internally with --cycles/--interval. That way one run covers the gap
-#     rather than a missed run leaving positions unmonitored for hours.
+#     The fix is "internal batching": the schedule asks for a run every 10
+#     minutes and each delivered run executes 2 cycles at 5-minute intervals,
+#     covering the 10-minute window. Asking for 10-minute slots is much more
+#     reliable than 15-minute ones (less contention), and the fewer cycles per
+#     run keep runtime under the timeout.
 #
-#     This reduces the damage but does NOT fix it. If a run is dropped, nothing
-#     is watching your stop-losses until the next one lands. For punctual
-#     monitoring you need an always-on host (VPS/systemd), not cron-on-Actions.
+#     This is still NOT a guarantee. If a run is dropped, nothing is watching
+#     your stop-losses until the next one lands. For punctual monitoring you
+#     need an always-on host (VPS/systemd), not cron-on-Actions.
 #
 #   * Public repos get unlimited free Actions minutes. Private repos get 2,000
-#     minutes/month and this schedule would exceed it.
+#     minutes/month and a 10-min schedule would exceed it.
 #   * Scheduled workflows are auto-DISABLED after 60 days of repository
 #     inactivity. GitHub emails you; re-enable it in the Actions tab.
 #   * This is fine for PAPER trading. Do not trust it with real money.
@@ -32,15 +31,12 @@ name: Crypto Bot Cycle
 
 on:
   schedule:
-    # Every 30 minutes. Deliberately NOT */15: the quarter-hour slots are the
-    # most contested on GitHub's scheduler and are dropped most often. Each
-    # delivered run covers the interval by running multiple cycles internally
-    # (see CYCLES_PER_RUN below).
-    - cron: "*/30 * * * *"
-  # Lets you trigger a run by hand from the Actions tab.
+    # Every 10 minutes. Two cycles at 5-minute intervals give full in-run
+    # coverage. 10-minute slots are less contested than 15 or 30, so delivery
+    # rate should be better.
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
-# Never let two cycles run at once - concurrent runs could double-submit orders.
 concurrency:
   group: crypto-bot-cycle
   cancel-in-progress: false
@@ -49,17 +45,14 @@ permissions:
   contents: read
 
 env:
-  # Each delivered run performs this many cycles, spaced CYCLE_INTERVAL apart,
-  # so a single run covers the whole 30-minute window. 6 x 300s = 25 minutes of
-  # coverage, finishing before the next scheduled run is due.
-  CYCLES_PER_RUN: "6"
+  CYCLES_PER_RUN: "2"
   CYCLE_INTERVAL: "300"
 
 jobs:
   cycle:
     runs-on: ubuntu-latest
-    # Must exceed CYCLES_PER_RUN * CYCLE_INTERVAL (25 min) plus setup overhead.
-    timeout-minutes: 32
+    # 2 cycles × 300s + ~2 min setup = ~12 min, round up generously
+    timeout-minutes: 15
 
     steps:
       - name: Check out the repository
@@ -71,9 +64,6 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # Transient "internal server error" / "job was not acquired by a runner"
-      # failures are a GitHub-side capacity problem, not a bug in this code.
-      # Retrying the install absorbs the most common flavour of it.
       - name: Install dependencies
         run: |
           for attempt in 1 2 3; do
@@ -89,8 +79,6 @@ jobs:
           echo "pip install failed after 3 attempts"
           exit 1
 
-      # Best-effort state carry-over between runs. Losing it is safe: the bot
-      # rebuilds TP/SL from Alpaca's average entry price on the next cycle.
       - name: Restore position state
         uses: actions/cache/restore@v4
         with:
@@ -115,7 +103,6 @@ jobs:
             --interval "${CYCLE_INTERVAL}"
 
       - name: Save position state
-        # Runs even if the cycle failed, so a partially updated state is kept.
         if: always()
         uses: actions/cache/save@v4
         with:
