@@ -384,7 +384,9 @@ drive it. `.github/workflows/trade.yml` is included and ready:
 2. **Settings → Secrets and variables → Actions → New repository secret**, and
    add `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`. Secrets are encrypted and are
    never visible in the repo, logs, or to forks.
-3. **Actions** tab → enable workflows. It then runs every 15 minutes.
+3. **Actions** tab → enable workflows. The workflow fires every 30 minutes; each
+   delivered run executes **6 cycles at 5-minute intervals** internally, so
+   in-run coverage is 25 of the 30 minutes rather than 1 check per half hour.
 4. Hit **Run workflow** once manually to confirm it works before trusting the
    schedule.
 
@@ -392,26 +394,34 @@ Run it locally the same way:
 
 ```bash
 python main.py --once          # one cycle, then exit
-python main.py --cycles 4      # four cycles, then exit
-python main.py --interval 300  # override the 15-minute gap
+python main.py --cycles 6      # six cycles, then exit
+python main.py --interval 300  # 5-minute gap between cycles
 ```
 
 The honest caveats:
 
-- **Keep the repo public**, or widen the cron. Public repos get unlimited free
-  Actions minutes; private repos get 2,000/month, and a run every 15 minutes
-  (~2,880 runs) blows straight through that. Your secrets are safe either way —
-  they live in GitHub Secrets, not in the code. Alternatively set the cron to
-  `*/30` or hourly.
-- **GitHub cron is best-effort.** Runs are routinely delayed 5–15+ minutes when
-  the platform is busy, and can be skipped entirely. Your stop-loss check is
-  therefore *less* punctual than the already-imperfect 15-minute polling. This
-  is acceptable on paper; it is not acceptable with real money.
+- **Keep the repo public**, or enlarge the cron. Public repos get unlimited
+  free Actions minutes. A 30-minute schedule on a private repo still exceeds
+  the 2,000-minute limit, so if you need this setup on a private repo set the
+  cron to hourly or wider.
+- **GitHub cron is best-effort.** Runs are routinely delayed 5–15+ minutes and
+  can be skipped entirely when the platform is under load.
+- **The `*/15` slot is the single most oversubscribed schedule on GitHub and
+  most of those slots are silently dropped.** That is why the workflow now uses
+  `*/30` with internal batching — you get far more *actual* deliveries from a
+  30-minute slot than by asking for 15. Each delivered run covers the gap with
+  multiple cycles. If a run is dropped, the gap is 60 minutes worst-case
+  instead of 240 minutes under the old config.
+- **`internal server error` / `job was not acquired by a runner`** are
+  GitHub-side capacity failures, not bugs in this code. The install step retries
+  three times to absorb the common flavour; a whole-job failure just means that
+  cycle did not happen. Re-run it from the Actions tab if you want.
 - **Scheduled workflows auto-disable after 60 days** of repo inactivity. GitHub
   emails you; re-enable from the Actions tab.
 - State is carried between runs via the Actions cache on a best-effort basis.
   If it is evicted, nothing breaks — the bot rebuilds TP/SL from Alpaca's
   average entry price on the next cycle.
+
 
 Other genuinely free options: **Oracle Cloud Always Free** gives you a real
 always-on VM (the best free choice, but sign-up is picky), and **your own PC**
@@ -563,6 +573,9 @@ the safe direction to err.
 | Every symbol logs `NEUTRAL` | Expected. The entry filter is narrow; verify with the backtest |
 | Orders rejected for buying power | Crypto is cash-only on Alpaca. Check `cash`, not margin buying power |
 | `403 forbidden` | Crypto trading not enabled on the account, or live keys used with `ALPACA_PAPER=true` |
+| Scheduled runs arrive every ~2 hours instead of on schedule | GitHub silently drops oversubscribed cron slots, `*/15` worst of all. Fixed by using `*/30` + multiple cycles per run |
+| `The job was not acquired by a runner` / `internal server error` | GitHub-side capacity failure, not your code. That cycle is simply skipped; re-run from the Actions tab |
+
 
 
 ---

@@ -1,21 +1,29 @@
-# Free 24/7-ish scheduling for the crypto bot using GitHub Actions cron.
+# Free scheduling for the crypto bot using GitHub Actions cron.
 #
 # WHY THIS WORKS WITHOUT PAYING FOR A HOST
 # The bot's `--once` mode runs a single cycle and exits. It reconciles against
 # Alpaca at the start of every run and treats the broker as the source of truth,
-# so it does not need a persistent disk or a long-lived process. GitHub runs the
-# cycle for you on a schedule.
+# so it does not need a persistent disk or a long-lived process.
 #
 # READ THIS BEFORE RELYING ON IT
+#   * GitHub cron is BEST EFFORT and it is NOT a reliable 15-minute timer.
+#     The `*/15` slot is the single most oversubscribed schedule on the whole
+#     platform, so GitHub silently DROPS most of those runs under load. In
+#     practice this workflow was delivering roughly one run every 2 hours -
+#     about 12% of the requested slots.
+#
+#     The mitigation below is "internal batching": the schedule asks for a run
+#     every 30 minutes (a far less contested slot, so far more of them are
+#     actually delivered), and each delivered run then executes SEVERAL cycles
+#     internally with --cycles/--interval. That way one run covers the gap
+#     rather than a missed run leaving positions unmonitored for hours.
+#
+#     This reduces the damage but does NOT fix it. If a run is dropped, nothing
+#     is watching your stop-losses until the next one lands. For punctual
+#     monitoring you need an always-on host (VPS/systemd), not cron-on-Actions.
+#
 #   * Public repos get unlimited free Actions minutes. Private repos get 2,000
-#     minutes/month - at ~2 min per run every 15 min (~2,880 runs/month) a
-#     private repo WILL exceed the free quota. Keep the repo public (secrets
-#     stay secret; they live in Settings -> Secrets, not in the code) or widen
-#     the schedule to every 30-60 minutes.
-#   * GitHub cron is BEST EFFORT. Runs are frequently delayed 5-15+ minutes
-#     under load and can occasionally be skipped entirely. Your stop-loss check
-#     is therefore even less punctual than the 15-minute polling already
-#     implies. See "Known risks" in README.md.
+#     minutes/month and this schedule would exceed it.
 #   * Scheduled workflows are auto-DISABLED after 60 days of repository
 #     inactivity. GitHub emails you; re-enable it in the Actions tab.
 #   * This is fine for PAPER trading. Do not trust it with real money.
@@ -24,8 +32,11 @@ name: Crypto Bot Cycle
 
 on:
   schedule:
-    # Every 15 minutes. Loosen to "*/30 * * * *" or "0 * * * *" to cut usage.
-    - cron: "*/15 * * * *"
+    # Every 30 minutes. Deliberately NOT */15: the quarter-hour slots are the
+    # most contested on GitHub's scheduler and are dropped most often. Each
+    # delivered run covers the interval by running multiple cycles internally
+    # (see CYCLES_PER_RUN below).
+    - cron: "*/30 * * * *"
   # Lets you trigger a run by hand from the Actions tab.
   workflow_dispatch:
 
@@ -37,10 +48,18 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Each delivered run performs this many cycles, spaced CYCLE_INTERVAL apart,
+  # so a single run covers the whole 30-minute window. 6 x 300s = 25 minutes of
+  # coverage, finishing before the next scheduled run is due.
+  CYCLES_PER_RUN: "6"
+  CYCLE_INTERVAL: "300"
+
 jobs:
   cycle:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Must exceed CYCLES_PER_RUN * CYCLE_INTERVAL (25 min) plus setup overhead.
+    timeout-minutes: 32
 
     steps:
       - name: Check out the repository
@@ -52,8 +71,23 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      # Transient "internal server error" / "job was not acquired by a runner"
+      # failures are a GitHub-side capacity problem, not a bug in this code.
+      # Retrying the install absorbs the most common flavour of it.
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::pip install (attempt $attempt)"
+            if pip install --disable-pip-version-check -r requirements.txt; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "pip install failed on attempt $attempt; retrying in 15s"
+            sleep 15
+          done
+          echo "pip install failed after 3 attempts"
+          exit 1
 
       # Best-effort state carry-over between runs. Losing it is safe: the bot
       # rebuilds TP/SL from Alpaca's average entry price on the next cycle.
@@ -65,7 +99,7 @@ jobs:
           restore-keys: |
             positions-
 
-      - name: Run one trading cycle
+      - name: Run trading cycles
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
@@ -75,7 +109,10 @@ jobs:
           MAX_TOTAL_EXPOSURE_PCT: "0.20"
           MIN_NOTIONAL_USD: "10"
           LOG_LEVEL: "INFO"
-        run: python -u main.py --once
+        run: |
+          python -u main.py \
+            --cycles "${CYCLES_PER_RUN}" \
+            --interval "${CYCLE_INTERVAL}"
 
       - name: Save position state
         # Runs even if the cycle failed, so a partially updated state is kept.
