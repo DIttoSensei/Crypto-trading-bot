@@ -10,11 +10,15 @@ IMPORTANT - Alpaca crypto constraints handled here:
   Python by :mod:`main`.
 * Crypto is cash-only (non-marginable), so ``non_marginable_buying_power`` /
   ``cash`` is used for sizing rather than ``buying_power``.
-* Quantities are rounded to ``config.QTY_PRECISION`` (4) decimals.
+* BUY quantities are rounded to ``config.QTY_PRECISION`` (4) decimals. SELL
+  quantities are FLOORED (truncated down), never rounded - rounding up can
+  request more than is actually held and get the exit order rejected for
+  insufficient balance, which strands the position and disables the stop-loss.
 * Orders are polled after submission so the *actual* filled quantity and
   average fill price are used for state, which correctly handles partial fills.
 """
 
+import math
 import time
 from typing import Any, Dict, List, Optional
 
@@ -158,8 +162,18 @@ class AlpacaExecutionClient:
         """
         Submit a GTC market SELL and return the realised fill details.
 
-        The requested quantity is clamped to the quantity actually held so the
-        order can never be rejected for insufficient holdings.
+        The requested quantity is clamped to the quantity actually held and then
+        FLOORED (truncated down) to ``QTY_PRECISION`` decimals. Rounding to
+        nearest can round *up* past what we actually hold (0.340967717 -> 0.341),
+        and Alpaca then rejects the order with "insufficient balance", which
+        strands the position and disables the take-profit / stop-loss. Flooring
+        leaves a negligible dust remainder instead, which is the safe direction
+        to err.
+
+        A full-position exit (``qty`` within precision of the held balance) is
+        routed through the broker's dedicated ``close_position`` endpoint, which
+        liquidates the EXACT held quantity - no dust remainder, and nothing that
+        could exceed the balance.
         """
         held = self.get_position_qty(symbol)
         if held <= 0:
@@ -167,9 +181,15 @@ class AlpacaExecutionClient:
             return self._failure(symbol, "sell", qty, "no live position at broker")
 
         qty = min(float(qty), held)
-        # Selling the full position: use the raw held qty to avoid dust remainders.
         if abs(qty - held) <= 10 ** (-config.QTY_PRECISION):
-            qty = held
+            # Full position: broker close liquidates the exact balance.
+            return self.close_position(symbol)
+
+        qty = _floor_qty(qty, config.QTY_PRECISION)
+        if qty <= 0:
+            log.warning("execute_sell: quantity %.8f floors to zero for %s.", qty, symbol)
+            return self._failure(symbol, "sell", qty, "quantity floors to zero")
+
         return self._submit_market_order(symbol, qty, OrderSide.SELL)
 
     def execute_limit_buy(self, symbol: str, qty: float, limit_price: float) -> Dict[str, Any]:
@@ -214,9 +234,17 @@ class AlpacaExecutionClient:
     def _submit_market_order(self, symbol: str, qty: float, side: OrderSide) -> Dict[str, Any]:
         action = "buy" if side == OrderSide.BUY else "sell"
         try:
-            qty = round(float(qty), config.QTY_PRECISION)
+            qty = float(qty)
         except (TypeError, ValueError):
             return self._failure(symbol, action, 0.0, "quantity is not numeric")
+
+        if action == "sell":
+            # NEVER round a sell up. Round-to-nearest can round past the real
+            # balance (0.340967717 -> 0.341) and Alpaca rejects the order for
+            # "insufficient balance", stranding the position. Floor instead.
+            qty = _floor_qty(qty, config.QTY_PRECISION)
+        else:
+            qty = round(qty, config.QTY_PRECISION)
 
         if qty <= 0:
             log.warning("%s order for %s skipped: quantity %.8f is not positive.",
@@ -338,3 +366,18 @@ class AlpacaExecutionClient:
             return float(value or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+
+def _floor_qty(qty: float, precision: int) -> float:
+    """
+    Truncate ``qty`` DOWN to ``precision`` decimals.
+
+    Ordinary ``round()`` rounds to nearest, which can round *up* past what we
+    actually own (0.340967717 -> 0.341). Selling a quantity larger than the
+    real balance gets rejected by Alpaca ("insufficient balance"), which would
+    strand the position and prevent the take-profit / stop-loss from ever
+    executing. Flooring can only ever leave a negligible dust remainder behind,
+    which is the safe direction to err.
+    """
+    factor = 10 ** int(precision)
+    return math.floor(float(qty) * factor) / factor

@@ -17,24 +17,38 @@
 #     reliable than 15-minute ones (less contention), and the fewer cycles per
 #     run keep runtime under the timeout.
 #
-#     This is still NOT a guarantee. If a run is dropped, nothing is watching
-#     your stop-losses until the next one lands. For punctual monitoring you
-#     need an always-on host (VPS/systemd), not cron-on-Actions.
+#   * This workflow defines TWO redundant schedules:
+#       - "*/10 * * * *"        (top of every 10 minutes)
+#       - "5-59/10 * * * *"     (5 minutes past every 10)
+#     GitHub evaluates each cron entry independently, so if one slot is dropped
+#     under load the other usually still fires. Two independent schedules cut
+#     the silent-drop window roughly in half. Both entries run the SAME job; the
+#     `concurrency` group prevents overlapping runs if they ever collide.
+#
+#     This is still NOT a guarantee. If both runs are dropped, nothing is
+#     watching your stop-losses until the next one lands. For punctual
+#     monitoring you need an always-on host (VPS/systemd), not cron-on-Actions.
 #
 #   * Public repos get unlimited free Actions minutes. Private repos get 2,000
 #     minutes/month and a 10-min schedule would exceed it.
 #   * Scheduled workflows are auto-DISABLED after 60 days of repository
 #     inactivity. GitHub emails you; re-enable it in the Actions tab.
 #   * This is fine for PAPER trading. Do not trust it with real money.
+#
+#   * State persistence: positions.json is carried between runs via the Actions
+#     cache on a best-effort basis. If the cache is evicted, nothing breaks -
+#     the bot rebuilds TP/SL from Alpaca's average entry price on the next run
+#     (and the reconcile + healing logic in state_manager/main keeps every live
+#     position tracked and protected even when the broker entry price is odd).
 
 name: Crypto Bot Cycle
 
 on:
   schedule:
-    # Every 10 minutes. Two cycles at 5-minute intervals give full in-run
-    # coverage. 10-minute slots are less contested than 15 or 30, so delivery
-    # rate should be better.
+    # Every 10 minutes (top of the hour slot).
     - cron: "*/10 * * * *"
+    # Every 10 minutes, offset by 5 (redundancy if the primary slot is dropped).
+    - cron: "5-59/10 * * * *"
   workflow_dispatch:
 
 concurrency:

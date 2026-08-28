@@ -33,6 +33,7 @@ of truth.
 """
 
 import argparse
+import math
 import signal
 import sys
 import time
@@ -137,10 +138,9 @@ class TradingBot:
         record: Dict[str, Any],
         price_map: Dict[str, float],
     ) -> None:
-        entry_price = float(record.get("entry_price", 0.0) or 0.0)
         qty = float(record.get("qty", 0.0) or 0.0)
 
-        if qty <= 0 or entry_price <= 0:
+        if qty <= 0:
             log.warning("Dropping malformed state record for %s: %r", symbol, record)
             self.state.remove_position(symbol)
             return
@@ -151,10 +151,36 @@ class TradingBot:
             return
         price = float(price)
 
-        take_profit = float(record.get("take_profit_price")
-                            or entry_price * (1.0 + config.TAKE_PROFIT_PCT))
-        stop_loss = float(record.get("stop_loss_price")
-                          or entry_price * (1.0 - config.STOP_LOSS_PCT))
+        entry_price = float(record.get("entry_price", 0.0) or 0.0)
+        if entry_price <= 0:
+            # Broker reported an implausible (negative/zero) average entry.
+            # Anchor TP/SL to the current market price so the position is
+            # never left unprotected; once healed, the levels persist.
+            log.warning(
+                "%s has an invalid entry price (%.4f). Healing it with the "
+                "current market price %.4f so TP/SL can be enforced.",
+                symbol, entry_price, price,
+            )
+            entry_price = price
+            take_profit = price * (1.0 + config.TAKE_PROFIT_PCT)
+            stop_loss = price * (1.0 - config.STOP_LOSS_PCT)
+            self.state.update_position(
+                symbol,
+                entry_price=entry_price,
+                take_profit_price=take_profit,
+                stop_loss_price=stop_loss,
+                trailing_stop_price=stop_loss,
+                highest_price=price,
+                needs_healing=False,
+            )
+            record["entry_price"] = entry_price
+            record["take_profit_price"] = take_profit
+            record["stop_loss_price"] = stop_loss
+        else:
+            take_profit = float(record.get("take_profit_price")
+                                or entry_price * (1.0 + config.TAKE_PROFIT_PCT))
+            stop_loss = float(record.get("stop_loss_price")
+                              or entry_price * (1.0 - config.STOP_LOSS_PCT))
 
         pnl_pct = (price / entry_price - 1.0) * 100.0
         log.info(
@@ -162,16 +188,50 @@ class TradingBot:
             symbol, price, entry_price, pnl_pct, take_profit, stop_loss, qty,
         )
 
-        # Track the high-water mark for reporting / future trailing logic.
+        # --- Trailing stop ratchet ---------------------------------------- #
+        # Once a position is in profit by TRAILING_ACTIVATE_PCT, the stop-loss
+        # ratchets UP to stay TRAILING_STOP_PCT below the highest price seen.
+        # Once the trailing stop has moved ABOVE the fixed take-profit level, it
+        # SUPERSEDES the take-profit - the winner keeps running until price
+        # falls back to the trailing level, instead of being capped at +5%.
         highest = float(record.get("highest_price", entry_price) or entry_price)
         if price > highest:
+            highest = price
             self.state.update_position(symbol, highest_price=price)
 
+        trailing_stop_price = float(record.get("trailing_stop_price") or stop_loss)
+        trailing_armed = config.TRAILING_ACTIVATE_PCT > 0 and (
+            highest / entry_price - 1.0 >= config.TRAILING_ACTIVATE_PCT
+        )
+        if trailing_armed:
+            # Ratchet off the true high-water mark, never below the last trailed
+            # level nor below the original hard stop.
+            trailed = max(
+                highest * (1.0 - config.TRAILING_STOP_PCT),
+                stop_loss,
+                trailing_stop_price,
+            )
+            if trailed > trailing_stop_price:
+                trailing_stop_price = trailed
+                if trailed > stop_loss:
+                    stop_loss = trailed
+                    log.info(
+                        "  %s: trailing stop ratcheted to %.4f (%.2f%% below high %.4f).",
+                        symbol, trailed, config.TRAILING_STOP_PCT * 100, highest,
+                    )
+                    self.state.update_position(symbol, trailing_stop_price=trailed)
+
         reason: Optional[str] = None
-        if price >= take_profit:
-            reason = "TAKE_PROFIT"
-        elif price <= stop_loss:
-            reason = "STOP_LOSS"
+        # Once the trailing stop has locked in more than the fixed TP, it is the
+        # only exit - sell when price falls back to it, never at the fixed TP.
+        if trailing_stop_price >= take_profit:
+            if price <= stop_loss:
+                reason = "TRAILING_STOP"
+        else:
+            if price >= take_profit:
+                reason = "TAKE_PROFIT"
+            elif price <= stop_loss:
+                reason = "STOP_LOSS"
 
         if reason is None:
             return

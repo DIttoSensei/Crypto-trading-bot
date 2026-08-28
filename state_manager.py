@@ -20,6 +20,15 @@ Schema of positions.json::
       }
     }
 
+Alpaca can report an implausible (negative or zero) average entry price for a
+crypto position that accrued yield/fees. Rather than adopt that garbage (which
+would make TP/SL levels negative and the position would be dropped as
+"malformed", leaving it live at the broker with NO stop-loss protection), the
+reconciler keeps tracking such positions with ``entry_price = 0.0`` and a
+``"needs_healing": true`` flag. :mod:`main` then heals the record with the
+current market price before any TP/SL evaluation. A live position is never
+silently dropped from tracking.
+
 Every write goes to a temporary file in the same directory and is then
 ``os.replace``-d over the target, which is atomic on both POSIX and Windows.
 That guarantees the file is never left half-written if the process dies.
@@ -265,6 +274,23 @@ class StateManager:
                 continue
             if qty <= 0:
                 continue
+
+            # Alpaca can report an implausible (negative or zero) average entry
+            # price for crypto positions that accrued yield/fees. Adopting that
+            # value verbatim would make TP/SL levels negative and the position
+            # gets dropped as "malformed" - leaving it live at the broker with
+            # NO stop-loss protection. Instead we keep tracking the position and
+            # use 0.0 as a "needs healing" sentinel; main heals it with the
+            # current market price before any TP/SL evaluation.
+            if avg_entry <= 0:
+                log.warning(
+                    "RECONCILE: %s broker avg_entry_price=%.6f is implausible. "
+                    "Tracking the position with a 0-entry sentinel; it will be "
+                    "healed with the current market price by the trading loop.",
+                    symbol, avg_entry,
+                )
+                avg_entry = 0.0
+
             normalised[symbol] = {"qty": qty, "avg_entry_price": avg_entry}
 
         with self._lock:
@@ -287,18 +313,37 @@ class StateManager:
                         "from local state. Adopting broker data as source of truth.",
                         symbol, qty, entry,
                     )
-                    reconciled[symbol] = {
-                        "symbol": symbol,
-                        "entry_price": entry,
-                        "qty": qty,
-                        "take_profit_price": entry * (1.0 + config.TAKE_PROFIT_PCT),
-                        "stop_loss_price": entry * (1.0 - config.STOP_LOSS_PCT),
-                        "trailing_stop_price": entry * (1.0 - config.STOP_LOSS_PCT),
-                        "highest_price": entry,
-                        "opened_at": _utc_now_iso(),
-                        "last_updated": _utc_now_iso(),
-                        "source": "reconciled",
-                    }
+                    if entry <= 0:
+                        # Sentinel record: entry/TP/SL are 0 until main heals
+                        # them with the current market price. Keeping the record
+                        # (instead of dropping it) means the live position is
+                        # never left unprotected.
+                        reconciled[symbol] = {
+                            "symbol": symbol,
+                            "entry_price": 0.0,
+                            "qty": qty,
+                            "take_profit_price": 0.0,
+                            "stop_loss_price": 0.0,
+                            "trailing_stop_price": 0.0,
+                            "highest_price": 0.0,
+                            "opened_at": _utc_now_iso(),
+                            "last_updated": _utc_now_iso(),
+                            "source": "reconciled",
+                            "needs_healing": True,
+                        }
+                    else:
+                        reconciled[symbol] = {
+                            "symbol": symbol,
+                            "entry_price": entry,
+                            "qty": qty,
+                            "take_profit_price": entry * (1.0 + config.TAKE_PROFIT_PCT),
+                            "stop_loss_price": entry * (1.0 - config.STOP_LOSS_PCT),
+                            "trailing_stop_price": entry * (1.0 - config.STOP_LOSS_PCT),
+                            "highest_price": entry,
+                            "opened_at": _utc_now_iso(),
+                            "last_updated": _utc_now_iso(),
+                            "source": "reconciled",
+                        }
                     continue
 
                 updated = dict(record)
@@ -310,6 +355,11 @@ class StateManager:
                     updated["qty"] = qty
 
                 local_entry = float(record.get("entry_price", 0.0) or 0.0)
+
+                # entry <= 0 means the broker reported an implausible average
+                # entry this cycle. NEVER overwrite a healthy local entry with
+                # that sentinel - healing in main uses the market price, which
+                # is the best available anchor and should not be clobbered.
                 if entry > 0 and (local_entry <= 0 or abs(local_entry - entry) / entry > 0.005):
                     log.warning(
                         "RECONCILE: %s entry price mismatch (local=%.6f broker=%.6f). "
@@ -321,13 +371,34 @@ class StateManager:
                     updated["stop_loss_price"] = entry * (1.0 - config.STOP_LOSS_PCT)
                     updated["trailing_stop_price"] = entry * (1.0 - config.STOP_LOSS_PCT)
                     updated["highest_price"] = max(entry, float(record.get("highest_price", entry)))
+                    updated.pop("needs_healing", None)
 
-                updated.setdefault("symbol", symbol)
-                updated.setdefault("highest_price", updated.get("entry_price", entry))
-                updated.setdefault(
-                    "trailing_stop_price",
-                    updated.get("stop_loss_price", entry * (1.0 - config.STOP_LOSS_PCT)),
-                )
+                if entry <= 0:
+                    # Broker still reports an implausible entry this cycle. Only
+                    # (re)arm the sentinel if the record has NOT already been
+                    # healed - once main anchored it to the market price, that
+                    # anchor is stable and must not be clobbered by the broker's
+                    # recurring bad value (which would re-anchor to whatever the
+                    # price is each cycle and make TP/SL drift).
+                    if local_entry <= 0:
+                        updated["entry_price"] = 0.0
+                        updated["take_profit_price"] = 0.0
+                        updated["stop_loss_price"] = 0.0
+                        updated["trailing_stop_price"] = 0.0
+                        updated["highest_price"] = 0.0
+                        updated["needs_healing"] = True
+                    else:
+                        # Healed: keep the stable anchor, just refresh timestamps.
+                        updated["needs_healing"] = False
+                else:
+                    updated.setdefault("symbol", symbol)
+                    updated.setdefault("highest_price", updated.get("entry_price", entry))
+                    updated.setdefault(
+                        "trailing_stop_price",
+                        updated.get("stop_loss_price", entry * (1.0 - config.STOP_LOSS_PCT)),
+                    )
+                    updated.pop("needs_healing", None)
+
                 updated["last_updated"] = _utc_now_iso()
                 reconciled[symbol] = updated
 

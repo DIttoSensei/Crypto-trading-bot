@@ -24,13 +24,16 @@ broker on every cycle.
 | Direction | Long only |
 | Take profit | `+5.0%` from the actual average fill price |
 | Stop loss | `-2.0%` from the actual average fill price |
+| Trailing stop | Arm at `+3.0%` profit, trail by `2.0%` from the high-water mark. Once the trailing stop moves above the fixed `+5%` TP it **supersedes the TP** - the winner keeps running until price falls back to the trailing level instead of being capped at +5% |
 | Max concurrent positions | `2` |
 | Risk per trade | `1%` of capital, sized off the 2% stop distance |
 | Max total exposure | `20%` of capital across all open positions |
 | Minimum order | `$10` notional (smaller sizes are skipped, not submitted) |
 
 Both entry conditions must be true on the most recent closed bar. Exits are
-evaluated every cycle against the latest price.
+evaluated every cycle against the latest price. Trailing settings are
+configurable (`TRAILING_ACTIVATE_PCT`, `TRAILING_STOP_PCT`); set
+`TRAILING_ACTIVATE_PCT=0` to disable trailing and use fixed TP/SL only.
 
 ---
 
@@ -233,6 +236,8 @@ Every value below can be overridden in `.env`.
 | `EMA_PROXIMITY_PCT` | `0.005` | Max distance from EMA(20) |
 | `TAKE_PROFIT_PCT` | `0.05` | +5% target |
 | `STOP_LOSS_PCT` | `0.02` | -2% stop |
+| `TRAILING_ACTIVATE_PCT` | `0.03` | Trail arms once profit reaches this. `0` disables trailing |
+| `TRAILING_STOP_PCT` | `0.02` | Stop stays this far below the high-water mark once armed |
 | `MAX_POSITIONS` | `2` | Concurrent position cap |
 | `MAX_RISK_PER_TRADE` | `0.01` | 1% of capital risked per trade |
 | `MAX_TOTAL_EXPOSURE_PCT` | `0.20` | 20% total deployed capital cap |
@@ -411,6 +416,11 @@ The honest caveats:
   the most oversubscribed on the platform and most of those runs are silently
   dropped. `*/10` slots have far less competition, so delivery rate should be
   much better — but it is still best-effort, not guaranteed.
+- **The workflow now defines TWO redundant schedules** (`*/10` and `5-59/10`,
+  i.e. top-of-slot and 5-minutes-offset). GitHub evaluates each cron entry
+  independently, so if one slot is dropped under load the other usually still
+  fires. That roughly halves the silent-drop window. The `concurrency` group
+  prevents overlapping runs if both ever land together.
 
 - **`internal server error` / `job was not acquired by a runner`** are
   GitHub-side capacity failures, not bugs in this code. The install step retries
@@ -420,13 +430,70 @@ The honest caveats:
   emails you; re-enable from the Actions tab.
 - State is carried between runs via the Actions cache on a best-effort basis.
   If it is evicted, nothing breaks — the bot rebuilds TP/SL from Alpaca's
-  average entry price on the next cycle.
+  average entry price on the next cycle (and the reconcile + healing logic keeps
+  every live position tracked and protected even when the broker reports an odd
+  average entry price).
 
+
+### Why not PythonAnywhere?
+
+PythonAnywhere's free tier **cannot run this bot**:
+
+- Free accounts cannot run an always-on background process. "Always-on tasks"
+  require the paid Hacker plan (~$5/mo).
+- Free scheduled tasks run at best every 15 minutes and are **not** backed by a
+  process that keeps trading logic warm — and they pause or drop under any
+  unpaid CPU/quota limits. The bot needs either a true 24/7 loop or a scheduler
+  that fires reliably; PythonAnywhere's free tier offers neither.
+- Storage and outbound API quotas on free accounts are also too small for a bot
+  that polls Alpaca every few minutes.
+
+So PythonAnywhere is **not** a fit for the free always-on requirement. Use the
+free options below instead.
 
 Other genuinely free options: **Oracle Cloud Always Free** gives you a real
 always-on VM (the best free choice, but sign-up is picky), and **your own PC**
 works if it truly never sleeps. Note that Render, Railway and Fly no longer
 offer a free tier that suits an always-on worker.
+
+
+### Oracle Cloud Always Free (recommended free always-on host)
+
+The only genuinely free option that is a real always-on server with a real
+disk — the closest thing to a free VPS. Steps:
+
+1. Sign up at <https://signup.cloud.oracle.com>. It asks for a card for
+   identity verification (no charge) and email/SMS confirmation. Approval can
+   take minutes to hours; if rejected, try a different card/email or the
+   GitHub Actions option while you wait.
+2. Create a **VM.Standard.E2.1.Micro** instance (Always Free, 1 OCPU / 1 GB
+   RAM, 50 GB boot volume). Pick Ubuntu 22.04/24.04.
+3. Upload an SSH key; connect: `ssh ubuntu@<public-ip>`.
+4. Install and run:
+
+   ```bash
+   sudo apt update && sudo apt install -y python3-venv git
+   git clone https://github.com/<your-user>/<your-repo>.git crypto-bot
+   cd crypto-bot
+   python3 -m venv venv && source venv/bin/activate
+   pip install -r requirements.txt
+   cp .env.example .env && nano .env      # paste paper keys
+   ```
+
+5. Run it under `systemd` so it restarts on reboot and survives disconnects
+   (the `### Linux (systemd)` section below has the exact unit). Set
+   `WorkingDirectory=/home/ubuntu/crypto-bot`.
+
+Caveats:
+
+- **Always Free instances can be reclaimed** by Oracle if the account shows low
+  activity. A bot polling Alpaca every 5–15 minutes keeps CPU busy enough that
+  this is unlikely to be an issue, but it is not a contractual guarantee.
+- 1 GB RAM is tight but fine for this bot (pandas + alpaca-py + one process).
+- Keep `TRAILING_ACTIVATE_PCT`/`TRAILING_STOP_PCT` in `.env`; the Oracle host
+  reads them like any other environment.
+- GitHub Actions still makes a sensible second layer: with the dual cron
+  schedule it can back up the VM and also serve as a manual "run now" button.
 
 ### Render (paid, ~$7/mo)
 
@@ -459,18 +526,20 @@ Render works, with caveats you should understand before choosing it:
 
 | Option | Cost | Verdict |
 |---|---|---|
-| **GitHub Actions + `--once`** | **free** | **Best free choice, already configured.** Cron is best-effort so timing drifts. Fine for paper |
-| Oracle Cloud Always Free VM | free | A real always-on VM with a real disk. Best free option technically; sign-up can be a hassle |
+| **GitHub Actions + `--once`** | **free** | **Free and already configured** (now with dual redundant cron schedules). Cron is best-effort so timing drifts; gaps are possible |
+| **Oracle Cloud Always Free VM** | **free** | **The only free always-on host with a real disk.** Best free option technically; sign-up is picky and instances can be reclaimed on idle |
 | Your own PC | free | Only if it genuinely never sleeps. Laptop sleep = unmonitored stops |
+| PythonAnywhere free | free | **Cannot run this bot.** No always-on tasks, schedule too coarse, CPU/storage quotas too small |
 | Small VPS (Hetzner/DigitalOcean) + systemd | ~$4-6/mo | Best value once you are paying. Real disk, no cold starts, full control |
 | Render Worker (Starter) | ~$7/mo | Easiest git-push deploy with managed restarts. Slightly more than a VPS for less control |
 | Railway / Fly.io | ~$5/mo | Equivalent to Render; Fly needs a volume for state |
 | AWS Lambda / EventBridge | ~free | Would work with `--once`, but needs packaging and external state. GitHub Actions gets you there with no effort |
 
-Short version: with no budget, use GitHub Actions — it is set up and costs
-nothing. If you later want punctual 15-minute cycles, a cheap VPS is the best
-value. What matters more than the host is that something keeps running: the
-stop-loss only exists while this code executes.
+Short version: with no budget, run the **Oracle Cloud Always Free VM** as your
+primary always-on monitor and keep **GitHub Actions (dual cron) as a free backup
+layer**. If you later want punctual 15-minute cycles with zero maintenance
+hassle, a cheap VPS is the best value. What matters more than the host is that
+something keeps running: the stop-loss only exists while this code executes.
 
 
 ---
@@ -549,11 +618,19 @@ a bad price is inherited with its stop already close to being hit — or already
 past it, in which case the bot sells on the very next cycle. Check what the
 account is holding before you start it.
 
-Quantities from the broker are floored, never rounded, to 4 decimals. Rounding
-to nearest could round *up* past the real balance (0.078593517 → 0.0786) and
-the exit order would be rejected for insufficient funds, leaving the stop-loss
-unable to fire. Flooring leaves a negligible dust remainder instead, which is
-the safe direction to err.
+**Odd broker entry prices are healed, never fatal.** Alpaca can report a
+negative or zero average entry price for a crypto position that accrued
+yield/fees. The bot keeps tracking such positions and re-anchors TP/SL to the
+current market price (instead of dropping the record and leaving the position
+unprotected at the broker).
+
+Quantities from the broker are floored, never rounded, to 4 decimals — and sell
+orders are floored the same way. Rounding to nearest could round *up* past the
+real balance (0.340967717 → 0.341) and the exit order would be rejected for
+"insufficient balance", leaving the take-profit/stop-loss unable to fire.
+Flooring leaves a negligible dust remainder instead, which is the safe
+direction to err. This was a real bug: exits were being rejected every cycle
+for exactly this reason while a position sat far in profit.
 
 
 ---
@@ -572,8 +649,10 @@ the safe direction to err.
 | `Position cap reached (2/2 open)` | `MAX_POSITIONS` is 2. Close a position or raise the cap |
 | Every symbol logs `NEUTRAL` | Expected. The entry filter is narrow; verify with the backtest |
 | Orders rejected for buying power | Crypto is cash-only on Alpaca. Check `cash`, not margin buying power |
+| `insufficient balance for X (requested: ... available: ...)` on exit | Fixed: sell quantities are now floored, never rounded up. Update to the latest code so the exit order requests no more than the held balance |
+| `Dropping malformed state record` with a negative entry price | Fixed: the bot now heals positions with implausible broker entry prices instead of dropping them. Update to the latest code; the position is re-anchored to the current market price and stays protected |
 | `403 forbidden` | Crypto trading not enabled on the account, or live keys used with `ALPACA_PAPER=true` |
-| Scheduled runs arrive every ~2 hours instead of on schedule | GitHub silently drops oversubscribed cron slots, `*/15` worst of all. Fixed by using `*/30` + multiple cycles per run |
+| Scheduled runs arrive every ~2 hours instead of on schedule | GitHub silently drops oversubscribed cron slots, `*/15` worst of all. The workflow now uses two redundant `*/10` schedules + 2 cycles per run |
 | `The job was not acquired by a runner` / `internal server error` | GitHub-side capacity failure, not your code. That cycle is simply skipped; re-run from the Actions tab |
 
 

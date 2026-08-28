@@ -83,6 +83,11 @@ BAR_LIMIT: int = _get_int("BAR_LIMIT", 250)
 # ---------------------------------------------------------------------------
 TAKE_PROFIT_PCT: float = _get_float("TAKE_PROFIT_PCT", 0.05)   # +5%
 STOP_LOSS_PCT: float = _get_float("STOP_LOSS_PCT", 0.02)       # -2%
+# Trailing stop: once a position is in profit by TRAILING_ACTIVATE_PCT, the
+# stop ratchets UP to stay that many percent below the highest price seen.
+# Set to 0.0 to disable trailing and rely on the fixed TP/SL only.
+TRAILING_ACTIVATE_PCT: float = _get_float("TRAILING_ACTIVATE_PCT", 0.03)   # arm at +3%
+TRAILING_STOP_PCT: float = _get_float("TRAILING_STOP_PCT", 0.02)           # trail by 2%
 
 # ---------------------------------------------------------------------------
 # Risk / capital management
@@ -151,6 +156,14 @@ def validate_config(require_keys: bool = True) -> None:
     if not (0 < TAKE_PROFIT_PCT < 5):
         raise RuntimeError("TAKE_PROFIT_PCT must be a positive fraction (e.g. 0.05).")
 
+    if TRAILING_ACTIVATE_PCT < 0:
+        raise RuntimeError("TRAILING_ACTIVATE_PCT must be >= 0 (0 disables trailing).")
+    if TRAILING_ACTIVATE_PCT > 0 and not (0 < TRAILING_STOP_PCT < 1):
+        raise RuntimeError(
+            "TRAILING_STOP_PCT must be a fraction between 0 and 1 (e.g. 0.02) "
+            "when trailing is enabled."
+        )
+
     if not (0 < MAX_RISK_PER_TRADE <= 1):
         raise RuntimeError("MAX_RISK_PER_TRADE must be a fraction between 0 and 1 (e.g. 0.01).")
 
@@ -169,7 +182,8 @@ def config_summary() -> str:
     return (
         f"PAPER={PAPER} | WATCHLIST={WATCHLIST} | TIMEFRAME={BAR_TIMEFRAME} | "
         f"SMA={SMA_PERIOD} EMA={EMA_PERIOD} RSI={RSI_PERIOD}<{RSI_BUY_THRESHOLD} | "
-        f"TP={TAKE_PROFIT_PCT:.2%} SL={STOP_LOSS_PCT:.2%} | "
+        f"TP={TAKE_PROFIT_PCT:.2%} SL={STOP_LOSS_PCT:.2%} "
+        f"TRAILING={'OFF' if TRAILING_ACTIVATE_PCT <= 0 else f'arm+{TRAILING_ACTIVATE_PCT:.2%} trail {TRAILING_STOP_PCT:.2%}'} | "
         f"MAX_POSITIONS={MAX_POSITIONS} RISK/TRADE={MAX_RISK_PER_TRADE:.2%} "
         f"MAX_EXPOSURE={MAX_TOTAL_EXPOSURE_PCT:.2%} MIN_NOTIONAL=${MIN_NOTIONAL_USD:.2f}"
     )
